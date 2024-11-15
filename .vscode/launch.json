@@ -1,0 +1,812 @@
+#include <iostream>
+#include <vector>
+#include <cstring>
+#include <iomanip>
+#include <string>
+#include <unordered_map>
+#include <cmath>
+#include <sstream>
+// Forward declarations
+std::string registerName(int reg);
+std::string floatRegName(int reg);
+
+// Instruction format definitions
+struct Instruction {
+    uint32_t raw;
+    uint32_t opcode;
+    uint32_t rd;
+    uint32_t rs1;
+    uint32_t rs2;
+    uint32_t funct3;
+    uint32_t funct7;
+    int32_t imm;
+    
+    std::string toString() const;
+};
+
+// Pipeline stage structure
+struct PipelineStage {
+    uint32_t pc;
+    Instruction inst;
+    bool bubble;
+    bool stall;
+    
+    PipelineStage() : pc(0), bubble(true), stall(false) {}
+};
+
+// Statistics tracking
+struct Statistics {
+    uint64_t total_cycles;
+    uint64_t instructions_completed;
+    uint64_t data_hazard_stalls;
+    uint64_t memory_stalls;
+    uint64_t control_hazard_stalls;
+    uint64_t ram_wait_cycles;
+    uint64_t cache_misses;
+    uint64_t branch_mispredictions;
+    uint64_t exceptions;
+    uint64_t total_branches;
+    
+    Statistics() : total_cycles(0), instructions_completed(0),
+                  data_hazard_stalls(0), memory_stalls(0),
+                  control_hazard_stalls(0), ram_wait_cycles(0),
+                  cache_misses(0), branch_mispredictions(0),
+                  exceptions(0), total_branches(0) {}
+    
+    float getCPI() const {
+        return static_cast<float>(total_cycles) / instructions_completed;
+    }
+    
+    void printDetailedStats() const {
+        std::cout << "\nDetailed Statistics:\n";
+        std::cout << "Total Cycles: " << total_cycles << "\n";
+        std::cout << "Instructions Completed: " << instructions_completed << "\n";
+        std::cout << "Data Hazard Stalls: " << data_hazard_stalls << "\n";
+        std::cout << "Memory Stalls: " << memory_stalls << "\n";
+        std::cout << "Control Hazard Stalls: " << control_hazard_stalls << "\n";
+        std::cout << "RAM Wait Cycles: " << ram_wait_cycles << "\n";
+        std::cout << "Cache Misses: " << cache_misses << "\n";
+        std::cout << "Branch Mispredictions: " << branch_mispredictions << "\n";
+        std::cout << "CPI: " << std::fixed << std::setprecision(2) << getCPI() << "\n";
+        
+        if(total_branches > 0) {
+            float mispredict_rate = static_cast<float>(branch_mispredictions) / total_branches;
+            std::cout << "Branch Mispredict Rate: " << (mispredict_rate * 100) << "%\n";
+        }
+    }
+};
+
+// Exception handling
+struct Exception {
+    enum class Type {
+        NONE,
+        INVALID_INSTRUCTION,
+        MEMORY_ACCESS_FAULT,
+        DIVIDE_BY_ZERO
+    };
+    
+    Type type;
+    uint32_t pc;
+    std::string message;
+    
+    Exception() : type(Type::NONE), pc(0) {}
+};
+
+// CPU state
+class CPUState {
+public:
+    uint32_t pc;
+    mutable std::vector<uint32_t> x_regs;  // Integer registers
+    mutable std::vector<float> f_regs;     // Float registers
+    Exception current_exception;
+    
+    CPUState() : pc(0), x_regs(32, 0), f_regs(32, 0.0f) {}
+    
+    void reset() {
+        pc = 0;
+        std::fill(x_regs.begin(), x_regs.end(), 0);
+        std::fill(f_regs.begin(), f_regs.end(), 0.0f);
+        current_exception = Exception();
+    }
+};
+
+// Helper functions implementation
+std::string registerName(int reg) {
+    static const char* names[] = {
+        "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+        "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+        "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+        "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"
+    };
+    if(reg >= 0 && reg < 32) return names[reg];
+    return "x" + std::to_string(reg);
+}
+
+std::string floatRegName(int reg) {
+    return "f" + std::to_string(reg);
+}
+
+// Instruction string conversion implementation
+std::string Instruction::toString() const {
+    char buffer[100];
+    switch(opcode) {
+        case 0x37:  // LUI
+            snprintf(buffer, sizeof(buffer), "lui %s, 0x%x", 
+                    registerName(rd).c_str(), imm >> 12);
+            break;
+        case 0x07:  // FLW
+            snprintf(buffer, sizeof(buffer), "flw %s, %d(%s)", 
+                    floatRegName(rd).c_str(), imm, registerName(rs1).c_str());
+            break;
+        case 0x27:  // FSW
+            snprintf(buffer, sizeof(buffer), "fsw %s, %d(%s)", 
+                    floatRegName(rs2).c_str(), imm, registerName(rs1).c_str());
+            break;
+        case 0x53:  // FADD.S
+            snprintf(buffer, sizeof(buffer), "fadd.s %s, %s, %s", 
+                    floatRegName(rd).c_str(), floatRegName(rs1).c_str(), 
+                    floatRegName(rs2).c_str());
+            break;
+        case 0x13:  // ADDI
+            snprintf(buffer, sizeof(buffer), "addi %s, %s, %d", 
+                    registerName(rd).c_str(), registerName(rs1).c_str(), imm);
+            break;
+        case 0x63:  // BNEZ
+            snprintf(buffer, sizeof(buffer), "bnez %s, %d", 
+                    registerName(rs1).c_str(), imm);
+            break;
+        case 0x6F:  // J
+            snprintf(buffer, sizeof(buffer), "j done");
+            break;
+        default:
+            snprintf(buffer, sizeof(buffer), "unknown");
+    }
+    return std::string(buffer);
+}
+
+// Instruction decoder
+class Decoder {
+public:
+    static Instruction decode(uint32_t raw_inst) {
+        Instruction inst;
+        inst.raw = raw_inst;
+        inst.opcode = raw_inst & 0x7F;
+        inst.rd = (raw_inst >> 7) & 0x1F;
+        inst.rs1 = (raw_inst >> 15) & 0x1F;
+        inst.rs2 = (raw_inst >> 20) & 0x1F;
+        inst.funct3 = (raw_inst >> 12) & 0x7;
+        inst.funct7 = (raw_inst >> 25) & 0x7F;
+        
+        switch(inst.opcode) {
+            case 0x37: // LUI
+                inst.imm = raw_inst & 0xFFFFF000;
+                break;
+            case 0x07: // FLW
+            case 0x13: // ADDI
+                inst.imm = ((int32_t)raw_inst) >> 20;
+                break;
+            case 0x27: // FSW
+                inst.imm = ((raw_inst >> 25) << 5) | ((raw_inst >> 7) & 0x1F);
+                break;
+            case 0x63: // BNEZ
+                inst.imm = ((raw_inst >> 31) << 12) | 
+                          ((raw_inst >> 7) << 11) |
+                          ((raw_inst >> 25) << 5) |
+                          ((raw_inst >> 8) & 0xF) << 1;
+                break;
+        }
+        return inst;
+    }
+};
+class Cache {
+private:
+    static const int CACHE_SIZE = 1024;
+    static const int BLOCK_SIZE = 32;
+    static const int NUM_WAYS = 4;
+    
+    struct CacheLine {
+        bool valid;
+        uint32_t tag;
+        std::vector<uint8_t> data;
+        uint32_t last_access;
+        
+        CacheLine() : valid(false), tag(0), data(BLOCK_SIZE), last_access(0) {}
+    };
+    
+    std::vector<std::vector<CacheLine>> cache;
+    uint32_t access_counter;
+    
+public:
+    Cache() : cache(CACHE_SIZE/(BLOCK_SIZE*NUM_WAYS), std::vector<CacheLine>(NUM_WAYS)),
+              access_counter(0) {}
+    
+    bool access(uint32_t address, bool is_write) {
+        uint32_t tag = address >> (int)log2(CACHE_SIZE);
+        uint32_t set_index = (address >> (int)log2(BLOCK_SIZE)) & 
+                            ((CACHE_SIZE/(BLOCK_SIZE*NUM_WAYS)) - 1);
+        
+        // Check for hit
+        for (auto& line : cache[set_index]) {
+            if (line.valid && line.tag == tag) {
+                line.last_access = ++access_counter;
+                return true;  // Cache hit
+            }
+        }
+        
+        // Cache miss - handle replacement
+        CacheLine* replace_line = nullptr;
+        uint32_t oldest_access = UINT32_MAX;
+        
+        for (auto& line : cache[set_index]) {
+            if (!line.valid) {
+                replace_line = &line;
+                break;
+            }
+            if (line.last_access < oldest_access) {
+                oldest_access = line.last_access;
+                replace_line = &line;
+            }
+        }
+        
+        // Update cache line
+        if (replace_line) {
+            replace_line->valid = true;
+            replace_line->tag = tag;
+            replace_line->last_access = ++access_counter;
+        }
+        
+        return false;  // Cache miss
+    }
+};
+
+class RAM {
+private:
+    std::vector<uint8_t> memory;
+    int wait_cycles;
+    Cache data_cache;
+    
+public:
+    RAM(size_t size) : memory(size, 0), wait_cycles(0) {}
+    
+    void write32(uint32_t addr, uint32_t value) {
+        if (addr + 3 >= memory.size()) return;
+        
+        if (!data_cache.access(addr, true)) {
+            wait_cycles += 2;
+        }
+        
+        memcpy(&memory[addr], &value, 4);
+        wait_cycles = 2;
+    }
+    
+    uint32_t read32(uint32_t addr) const {
+        if (addr + 3 >= memory.size()) return 0;
+        
+        uint32_t value;
+        memcpy(&value, &memory[addr], 4);
+        return value;
+    }
+    
+    void writeFloat(uint32_t addr, float value) {
+        write32(addr, *reinterpret_cast<uint32_t*>(&value));
+    }
+    
+    float readFloat(uint32_t addr) const {
+        uint32_t bits = read32(addr);
+        return *reinterpret_cast<const float*>(&bits);
+    }
+    
+    bool isWaiting() const { return wait_cycles > 0; }
+    void tick() { if (wait_cycles > 0) wait_cycles--; }
+};
+
+class BranchPredictor {
+private:
+    static const int HISTORY_BITS = 2;
+    static const int TABLE_SIZE = 1024;
+    
+    struct PredictorEntry {
+        uint8_t state;
+        PredictorEntry() : state(2) {} // Initialize to "Weakly Taken"
+    };
+    
+    std::vector<PredictorEntry> branch_table;
+    
+public:
+    BranchPredictor() : branch_table(TABLE_SIZE) {}
+    
+    bool predict(uint32_t pc) {
+        uint32_t index = (pc >> 2) & (TABLE_SIZE - 1);
+        return branch_table[index].state >= 2;
+    }
+    
+    void update(uint32_t pc, bool taken) {
+        uint32_t index = (pc >> 2) & (TABLE_SIZE - 1);
+        uint8_t& state = branch_table[index].state;
+        
+        if (taken) {
+            if (state < 3) state++;
+        } else {
+            if (state > 0) state--;
+        }
+    }
+};
+
+class ForwardingUnit {
+public:
+    enum class ForwardSource {
+        NONE,
+        EX_MEM,
+        MEM_WB
+    };
+    
+    std::pair<ForwardSource, ForwardSource> checkForwarding(
+        const PipelineStage& id_ex,
+        const PipelineStage& ex_mem,
+        const PipelineStage& mem_wb) {
+        
+        ForwardSource forwardA = ForwardSource::NONE;
+        ForwardSource forwardB = ForwardSource::NONE;
+        
+        if (!ex_mem.bubble && ex_mem.inst.rd != 0) {
+            if (ex_mem.inst.rd == id_ex.inst.rs1) forwardA = ForwardSource::EX_MEM;
+            if (ex_mem.inst.rd == id_ex.inst.rs2) forwardB = ForwardSource::EX_MEM;
+        }
+        
+        if (!mem_wb.bubble && mem_wb.inst.rd != 0) {
+            if (mem_wb.inst.rd == id_ex.inst.rs1 && forwardA == ForwardSource::NONE)
+                forwardA = ForwardSource::MEM_WB;
+            if (mem_wb.inst.rd == id_ex.inst.rs2 && forwardB == ForwardSource::NONE)
+                forwardB = ForwardSource::MEM_WB;
+        }
+        
+        return {forwardA, forwardB};
+    }
+};
+class Pipeline {
+private:
+    CPUState cpu;
+    RAM& ram;
+    Statistics stats;
+    BranchPredictor branch_predictor;
+    ForwardingUnit forwarding_unit;
+    Cache instruction_cache;
+    
+    PipelineStage if_stage;
+    PipelineStage id_stage;
+    PipelineStage ex_stage;
+    PipelineStage mem_stage;
+    PipelineStage wb_stage;
+    
+    bool branch_taken;
+    uint32_t branch_target;
+    uint32_t last_branch_pc;
+
+public:
+    Pipeline(RAM& ram_) : ram(ram_), branch_taken(false), branch_target(0), last_branch_pc(0) {
+        reset();
+    }
+    
+    void reset() {
+        cpu.reset();
+        if_stage = PipelineStage();
+        id_stage = PipelineStage();
+        ex_stage = PipelineStage();
+        mem_stage = PipelineStage();
+        wb_stage = PipelineStage();
+        branch_taken = false;
+        branch_target = 0;
+        last_branch_pc = 0;
+    }
+    
+    void tick() {
+        // Handle exceptions
+        if (cpu.current_exception.type != Exception::Type::NONE) {
+            handleException();
+            return;
+        }
+
+        // Pipeline stages must be processed in reverse order
+        if (!wb_stage.bubble) {
+            writeBack();
+        }
+        
+        // Advance pipeline registers first
+        wb_stage = mem_stage;
+        mem_stage = ex_stage;
+        ex_stage = id_stage;
+        id_stage = if_stage;
+        
+        // Clear the new IF stage
+        if_stage.bubble = true;  // Will be set to false if fetch succeeds
+        
+        // Execute stages
+        if (!mem_stage.bubble) {
+            memory();
+        }
+        
+        if (!ex_stage.bubble) {
+            execute();
+        }
+        
+        if (!id_stage.bubble) {
+            decode();
+        }
+        
+        fetch();  // Always try to fetch
+
+        // Update branch and PC
+        if (branch_taken) {
+            cpu.pc = branch_target;
+            if_stage.bubble = true;
+            id_stage.bubble = true;
+            branch_taken = false;
+            stats.control_hazard_stalls += 2;
+        }
+
+        stats.total_cycles++;
+        ram.tick();
+    }
+    
+    // Getter methods
+    const PipelineStage& getIFStage() const { return if_stage; }
+    const PipelineStage& getIDStage() const { return id_stage; }
+    const PipelineStage& getEXStage() const { return ex_stage; }
+    const PipelineStage& getMEMStage() const { return mem_stage; }
+    const PipelineStage& getWBStage() const { return wb_stage; }
+    const Statistics& getStats() const { return stats; }
+    const CPUState& getCPUState() const { return cpu; }
+
+private:
+    void fetch() {
+        if (ram.isWaiting()) {
+            stats.ram_wait_cycles++;
+            return;
+        }
+
+        if_stage.pc = cpu.pc;
+        if_stage.inst = Decoder::decode(ram.read32(cpu.pc));
+        if_stage.bubble = false;
+        cpu.pc += 4;
+    }
+
+    void decode() {
+        bool hazard = checkDataHazards();
+        
+        if (hazard) {
+            stats.data_hazard_stalls++;
+            ex_stage.bubble = true;
+            return;
+        }
+        
+        if (id_stage.inst.opcode == 0x63) { // BNEZ
+            bool prediction = branch_predictor.predict(id_stage.pc);
+            if (prediction) {
+                branch_target = id_stage.pc + id_stage.inst.imm;
+                branch_taken = true;
+                last_branch_pc = id_stage.pc;
+            }
+        }
+    }
+
+    void execute() {
+        bool success = true;
+        switch (ex_stage.inst.opcode) {
+            case 0x37: // LUI
+                if (ex_stage.inst.rd != 0) {
+                    cpu.x_regs[ex_stage.inst.rd] = ex_stage.inst.imm;
+                }
+                break;
+
+            case 0x53: // FADD.S
+                if (ex_stage.inst.funct7 == 0x00) {
+                    float rs1_val = cpu.f_regs[ex_stage.inst.rs1];
+                    float rs2_val = cpu.f_regs[ex_stage.inst.rs2];
+                    cpu.f_regs[ex_stage.inst.rd] = rs1_val + rs2_val;
+                }
+                break;
+
+            case 0x13: // ADDI
+                if (ex_stage.inst.rd != 0) {
+                    cpu.x_regs[ex_stage.inst.rd] = cpu.x_regs[ex_stage.inst.rs1] + 
+                                                  ex_stage.inst.imm;
+                }
+                break;
+
+            case 0x63: // BNEZ
+                stats.total_branches++;
+                if (cpu.x_regs[ex_stage.inst.rs1] != 0) {
+                    branch_target = ex_stage.pc + ex_stage.inst.imm;
+                    branch_taken = true;
+                    last_branch_pc = ex_stage.pc;
+                }
+                break;
+
+            default:
+                success = false;
+                break;
+        }
+
+        if (success) {
+            stats.instructions_completed++;
+        }
+    }
+
+    void memory() {
+        bool mem_success = true;
+        switch (mem_stage.inst.opcode) {
+            case 0x07: // FLW
+                if (!ram.isWaiting()) {
+                    uint32_t addr = cpu.x_regs[mem_stage.inst.rs1] + mem_stage.inst.imm;
+                    cpu.f_regs[mem_stage.inst.rd] = ram.readFloat(addr);
+                } else {
+                    stats.memory_stalls++;
+                    mem_success = false;
+                }
+                break;
+
+            case 0x27: // FSW
+                if (!ram.isWaiting()) {
+                    uint32_t addr = cpu.x_regs[mem_stage.inst.rs1] + mem_stage.inst.imm;
+                    ram.writeFloat(addr, cpu.f_regs[mem_stage.inst.rs2]);
+                } else {
+                    stats.memory_stalls++;
+                    mem_success = false;
+                }
+                break;
+        }
+
+        if (!mem_success) {
+            wb_stage.bubble = true;
+        }
+    }
+
+    void writeBack() {
+        if (!wb_stage.bubble && !wb_stage.stall) {
+            stats.instructions_completed++;
+        }
+    }
+
+    bool checkDataHazards() {
+        if (!ex_stage.bubble && ex_stage.inst.rd != 0) {
+            if (ex_stage.inst.rd == id_stage.inst.rs1 ||
+                ex_stage.inst.rd == id_stage.inst.rs2) {
+                return true;
+            }
+        }
+
+        if (!mem_stage.bubble && mem_stage.inst.rd != 0) {
+            if (mem_stage.inst.rd == id_stage.inst.rs1 ||
+                mem_stage.inst.rd == id_stage.inst.rs2) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void handleException() {
+        std::cout << "Exception at PC 0x" << std::hex << cpu.current_exception.pc 
+                  << ": " << cpu.current_exception.message << std::endl;
+        stats.exceptions++;
+        reset();
+    }
+};
+
+#include <iostream>
+#include <iomanip>
+#include <vector>
+#include <stdexcept>
+
+class Simulator {
+private:
+    RAM ram;
+    Pipeline pipeline;
+    std::vector<uint32_t> program;
+    std::vector<float> array_a;
+    std::vector<float> array_b;
+    std::vector<float> array_c;
+
+public:
+    Simulator() : ram(0x20000), pipeline(ram) {
+        // Initialize test data
+        array_a.resize(256);
+        array_b.resize(256);
+        array_c.resize(256);
+        
+        // Fill test arrays
+        for(int i = 0; i < 256; i++) {
+            array_a[i] = static_cast<float>(i + 1);
+            array_b[i] = static_cast<float>(i * 2);
+            array_c[i] = static_cast<float>(i);
+        }
+    }
+
+    void loadProgram(const std::vector<uint32_t>& instructions) {
+        std::cout << "Program Instructions:\n------------------\n";
+        for(size_t i = 0; i < instructions.size(); i++) {
+            uint32_t addr = i * 4;
+            ram.write32(addr, instructions[i]);
+            
+            Instruction decoded = Decoder::decode(instructions[i]);
+            std::cout << "0x" << std::hex << std::setfill('0') << std::setw(8) 
+                      << instructions[i] << ": " << decoded.toString() << "\n";
+        }
+    }
+
+    void initializeMemory() {
+        std::cout << "\nInitializing system...\n";
+        std::cout << "Loading input arrays...\n";
+
+        // Load Array A starting at 0x400
+        for(int i = 0; i < 256; i++) {
+            ram.writeFloat(0x400 + i * 4, array_a[i]);
+        }
+
+        // Load Array B starting at 0x800
+        for(int i = 0; i < 256; i++) {
+            ram.writeFloat(0x800 + i * 4, array_b[i]);
+        }
+        
+        // Load Array c starting at 0xC00
+        for(int i = 0; i < 256; i++) {
+            ram.writeFloat(0xC00 + i , array_c[i]);
+        }
+        
+        
+
+        // Print all 256 initial values
+        std::cout << "Initial Values (all 256 elements):\n";
+        for(int i = 0; i < 256; i++) {
+            float expected = array_a[i] + array_b[i];
+            std::cout << "A[" << std::setw(3) << i << "] = " << std::fixed 
+                      << std::setprecision(1) << std::setw(8) << array_a[i] 
+                      << ", B[" << std::setw(3) << i << "] = " << std::setw(8) 
+                      << array_b[i] << ",  C[" << std::setw(3) << i 
+                      << "] = " << std::setw(8) << expected << "\n";
+        }
+        
+        printRegisterState();
+    }
+
+    void run() {
+        std::cout << "\nStarting simulation...\n";
+        uint64_t cycle = 0;
+        bool done = false;
+
+        while(!done && cycle < 10000) {
+            if(cycle < 20) {
+                printCycleInfo(cycle);
+            } else if(cycle % 1000 == 0) {
+                std::cout << "Executed " << cycle << " cycles...\n";
+            }
+
+            pipeline.tick();
+            cycle++;
+
+            const CPUState& cpu = pipeline.getCPUState();
+            if(cpu.pc == 0x3C && cycle > 100) {
+                done = true;
+            }
+        }
+
+        if (cycle >= 10000) {
+            std::cout << "\nSimulation reached cycle limit without completion.\n";
+        } else {
+            std::cout << "\nSimulation completed normally after " << cycle << " cycles.\n";
+        }
+        
+        validateResults();
+        pipeline.getStats().printDetailedStats();
+    }
+
+private:
+    void printCycleInfo(uint64_t cycle) {
+        std::cout << "Cycle " << cycle + 1 << ":\n";
+        printStage("IF", pipeline.getIFStage());
+        printStage("ID", pipeline.getIDStage());
+        printStage("EX", pipeline.getEXStage());
+        printStage("MEM", pipeline.getMEMStage());
+        printStage("WB", pipeline.getWBStage());
+
+        if(cycle % 50 == 49) {
+            printRegisterState();
+            std::cout << "----------------------------------------\n";
+        }
+    }
+
+    void printStage(const std::string& name, const PipelineStage& stage) {
+        std::cout << name << ":  ";
+        if(stage.bubble) {
+            std::cout << "PC=0x" << std::hex << std::setfill('0') << std::setw(8) 
+                      << stage.pc << " bubble\n";
+        } else {
+            std::cout << "PC=0x" << std::hex << std::setfill('0') << std::setw(8) 
+                      << stage.pc << " " << stage.inst.toString() << "\n";
+        }
+    }
+
+    void printRegisterState() {
+        const CPUState& cpu = pipeline.getCPUState();
+        std::cout << "\nRegister State:\n---------------\n";
+        std::cout << "Integer Registers:\n";
+        std::cout << "sp (x2)  = 0x" << std::hex << cpu.x_regs[2] << "\n";
+        std::cout << "t0 (x5)  = 0x" << std::hex << cpu.x_regs[5] << " (A_ptr)\n";
+        std::cout << "t1 (x6)  = 0x" << std::hex << cpu.x_regs[6] << " (B_ptr)\n";
+        std::cout << "t2 (x7)  = 0x" << std::hex << cpu.x_regs[7] << " (C_ptr)\n";
+        std::cout << "t3 (x28) = " << std::dec << cpu.x_regs[28] << " (counter)\n";
+        
+        std::cout << "Float Registers:\n";
+        for(int i = 0; i < 4; i++) {
+            std::cout << "f" << i << " = " << std::fixed << std::setprecision(2) 
+                      << cpu.f_regs[i] << "\n";
+        }
+    }
+
+    void validateResults() {
+        std::cout << "Validating results...\n";
+        bool valid = true;
+        
+        std::cout << "\nFinal Results (all 256 elements):\n";
+        for(int i = 0; i < 256; i++) {
+            float actual = ram.readFloat(0xC00 + i * 4);
+            float expected = array_a[i] + array_b[i];
+            std::cout << "C[" << std::setw(3) << i << "] = " << std::fixed 
+                      << std::setprecision(1) << std::setw(8) << actual 
+                      << " (Expected: " << std::setw(8) << expected << ")";
+            
+            if(std::abs(actual - expected) > 0.001f) {
+                valid = false;
+                std::cout << " [MISMATCH]";
+            }
+            std::cout << "\n";
+        }
+        
+        std::cout << "\nValidation " << (valid ? "PASSED" : "FAILED") << "\n";
+        
+        if (!valid) {
+            int mismatches = 0;
+            for(int i = 0; i < 256; i++) {
+                float actual = ram.readFloat(0xC00 + i * 4);
+                float expected = array_a[i] + array_b[i];
+                if(std::abs(actual - expected) > 0.001f) {
+                    mismatches++;
+                }
+            }
+            std::cout << "Total mismatches: " << mismatches << " out of 256 elements\n";
+        }
+    }
+}; // End of Simulator class
+
+int main() {
+    // Vector addition program machine code
+    std::vector<uint32_t> program = {
+        0x10000137,  // lui sp, 0x10000
+        0x00400293,  // li t0, 0x400
+        0x00800313,  // li t1, 0x800
+        0x00C00393,  // li t2, 0xC00
+        0x10000E13,  // li t3, 256
+        0x0002A007,  // flw ft0, 0(t0)
+        0x00032087,  // flw ft1, 0(t1)
+        0x001078D3,  // fadd.s ft2, ft0, ft1
+        0x01242027,  // fsw ft2, 0(t2)
+        0x00428293,  // addi t0, t0, 4
+        0x00430313,  // addi t1, t1, 4
+        0x00438393,  // addi t2, t2, 4
+        0xFFFE0E13,  // addi t3, t3, -1
+        0xFC0E1CE3,  // bnez t3, -36
+        0x0000006F   // j done
+    };
+
+    try {
+        Simulator sim;
+        sim.loadProgram(program);
+        sim.initializeMemory();
+        sim.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
